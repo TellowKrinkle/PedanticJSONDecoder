@@ -106,6 +106,73 @@ fileprivate func _convertToSnakeCase(_ stringKey: String) -> String {
 
 /// `PedanticJSONDecoder` facilitates the decoding of JSON into semantic `Decodable` types.
 open class PedanticJSONDecoder {
+	fileprivate class IgnoredKeysTracker {
+		struct DictionaryTracker {
+			let tracker: IgnoredKeysTracker
+			let list: Int
+			init(path: [CodingKey], keys: Set<String>, on tracker: IgnoredKeysTracker) {
+				self.tracker = tracker
+				self.list = tracker.dictionaries.count
+				tracker.dictionaries.append((path, keys))
+			}
+			func use(_ key: String) { tracker.dictionaries[list].list.remove(key) }
+		}
+
+		struct ArrayTracker {
+			let tracker: IgnoredKeysTracker
+			let list: Int
+			init(path: [CodingKey], keys: Set<Int>, on tracker: IgnoredKeysTracker) {
+				self.tracker = tracker
+				self.list = tracker.arrays.count
+				tracker.arrays.append((path, keys))
+			}
+			func use(_ key: Int) { tracker.arrays[list].list.remove(key) }
+		}
+
+		var dictionaries: [(path: [CodingKey], list: Set<String>)] = []
+		var arrays: [(path: [CodingKey], list: Set<Int>)] = []
+
+		func assertEmpty() throws {
+			let nonemptyDictionaries = dictionaries.filter { !$0.list.isEmpty }
+			let nonemptyArrays = arrays.filter { !$0.list.isEmpty }
+			if !(nonemptyDictionaries.isEmpty && nonemptyArrays.isEmpty) {
+				let dic = nonemptyDictionaries.map { IgnoredKeys(path: $0.path, ignoredKeys: $0.list.map { .dictionary($0) }) }
+				let arr = nonemptyArrays.map { IgnoredKeys(path: $0.path, ignoredKeys: $0.list.map { .array($0) }) }
+				throw IgnoredKeysError(keysets: dic + arr)
+			}
+		}
+	}
+
+	public enum JSONKey: CustomStringConvertible {
+		case dictionary(String)
+		case array(Int)
+
+		public var description: String {
+			switch self {
+			case .dictionary(let key): return key
+			case      .array(let key): return String(key)
+			}
+		}
+	}
+
+	public struct IgnoredKeys: CustomStringConvertible {
+
+		let path: [CodingKey]
+		let ignoredKeys: [JSONKey]
+
+		public var description: String {
+			return "Ignored the keys \(ignoredKeys) at path \(path)"
+		}
+	}
+
+	public struct IgnoredKeysError: Error, CustomStringConvertible {
+		public internal(set) var keysets: [IgnoredKeys]
+
+		public var description: String {
+			return keysets.lazy.map(String.init(describing:)).joined(separator: "\n")
+		}
+	}
+
 	// MARK: Options
 
 	/// The strategy to use for decoding `Date` values.
@@ -274,11 +341,14 @@ open class PedanticJSONDecoder {
 		} catch {
 			throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "The given data was not valid JSON.", underlyingError: error))
 		}
+		let tracker = IgnoredKeysTracker()
 
-		let decoder = _PedanticJSONDecoder(referencing: topLevel, options: self.options)
+		let decoder = _PedanticJSONDecoder(referencing: topLevel, options: self.options, tracker: tracker)
 		guard let value = try decoder.unbox(topLevel, as: type) else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: [], debugDescription: "The given data did not contain a top-level value."))
 		}
+
+		try tracker.assertEmpty()
 
 		return value
 	}
@@ -298,6 +368,8 @@ fileprivate class _PedanticJSONDecoder : Decoder {
 	/// The path to the current point in encoding.
 	fileprivate(set) public var codingPath: [CodingKey]
 
+	fileprivate var tracker: PedanticJSONDecoder.IgnoredKeysTracker
+
 	/// Contextual user-provided information for use during encoding.
 	public var userInfo: [CodingUserInfoKey : Any] {
 		return self.options.userInfo
@@ -306,11 +378,12 @@ fileprivate class _PedanticJSONDecoder : Decoder {
 	// MARK: - Initialization
 
 	/// Initializes `self` with the given top-level container and options.
-	fileprivate init(referencing container: Any, at codingPath: [CodingKey] = [], options: PedanticJSONDecoder._Options) {
+	fileprivate init(referencing container: Any, at codingPath: [CodingKey] = [], options: PedanticJSONDecoder._Options, tracker: PedanticJSONDecoder.IgnoredKeysTracker) {
 		self.storage = _JSONDecodingStorage()
 		self.storage.push(container: container)
 		self.codingPath = codingPath
 		self.options = options
+		self.tracker = tracker
 	}
 
 	// MARK: - Decoder Methods
@@ -397,6 +470,9 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	/// A reference to the container we're reading from.
 	private let container: [String : Any]
 
+	/// For tracking the keys we've used
+	private let tracker: PedanticJSONDecoder.IgnoredKeysTracker.DictionaryTracker
+
 	/// The path of coding keys taken to get to this point in decoding.
 	private(set) public var codingPath: [CodingKey]
 
@@ -420,6 +496,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 			}, uniquingKeysWith: { (first, _) in first })
 		}
 		self.codingPath = decoder.codingPath
+		self.tracker = .init(path: codingPath, keys: Set(container.keys), on: decoder.tracker)
 	}
 
 	// MARK: - KeyedDecodingContainerProtocol Methods
@@ -429,6 +506,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func contains(_ key: Key) -> Bool {
+		tracker.use(key.stringValue)
 		return self.container[key.stringValue] != nil
 	}
 
@@ -450,6 +528,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decodeNil(forKey key: Key) throws -> Bool {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -458,6 +537,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -473,6 +553,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Int.Type, forKey key: Key) throws -> Int {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -488,6 +569,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Int8.Type, forKey key: Key) throws -> Int8 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -503,6 +585,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Int16.Type, forKey key: Key) throws -> Int16 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -518,6 +601,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Int32.Type, forKey key: Key) throws -> Int32 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -533,6 +617,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Int64.Type, forKey key: Key) throws -> Int64 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -548,6 +633,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: UInt.Type, forKey key: Key) throws -> UInt {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -563,6 +649,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: UInt8.Type, forKey key: Key) throws -> UInt8 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -578,6 +665,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: UInt16.Type, forKey key: Key) throws -> UInt16 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -593,6 +681,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: UInt32.Type, forKey key: Key) throws -> UInt32 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -608,6 +697,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: UInt64.Type, forKey key: Key) throws -> UInt64 {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -623,6 +713,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Float.Type, forKey key: Key) throws -> Float {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -638,6 +729,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: Double.Type, forKey key: Key) throws -> Double {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -653,6 +745,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode(_ type: String.Type, forKey key: Key) throws -> String {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -668,6 +761,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func decode<T : Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
+		tracker.use(key.stringValue)
 		guard let entry = self.container[key.stringValue] else {
 			throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
 		}
@@ -683,6 +777,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func nestedContainer<NestedKey>(keyedBy type: NestedKey.Type, forKey key: Key) throws -> KeyedDecodingContainer<NestedKey> {
+		tracker.use(key.stringValue)
 		self.decoder.codingPath.append(key)
 		defer { self.decoder.codingPath.removeLast() }
 
@@ -701,6 +796,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 	}
 
 	public func nestedUnkeyedContainer(forKey key: Key) throws -> UnkeyedDecodingContainer {
+		tracker.use(key.stringValue)
 		self.decoder.codingPath.append(key)
 		defer { self.decoder.codingPath.removeLast() }
 
@@ -722,7 +818,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
 		defer { self.decoder.codingPath.removeLast() }
 
 		let value: Any = self.container[key.stringValue] ?? NSNull()
-		return _PedanticJSONDecoder(referencing: value, at: self.decoder.codingPath, options: self.decoder.options)
+		return _PedanticJSONDecoder(referencing: value, at: self.decoder.codingPath, options: self.decoder.options, tracker: decoder.tracker)
 	}
 
 	public func superDecoder() throws -> Decoder {
@@ -749,6 +845,9 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	/// The index of the element we're about to decode.
 	private(set) public var currentIndex: Int
 
+	/// For tracking the keys we've used
+	private let tracker: PedanticJSONDecoder.IgnoredKeysTracker.ArrayTracker
+
 	// MARK: - Initialization
 
 	/// Initializes `self` by referencing the given decoder and container.
@@ -757,6 +856,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 		self.container = container
 		self.codingPath = decoder.codingPath
 		self.currentIndex = 0
+		self.tracker = .init(path: codingPath, keys: Set(container.indices), on: decoder.tracker)
 	}
 
 	// MARK: - UnkeyedDecodingContainer Methods
@@ -770,6 +870,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decodeNil() throws -> Bool {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(Any?.self, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -783,6 +884,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Bool.Type) throws -> Bool {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -799,6 +901,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Int.Type) throws -> Int {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -815,6 +918,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Int8.Type) throws -> Int8 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -831,6 +935,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Int16.Type) throws -> Int16 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -847,6 +952,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Int32.Type) throws -> Int32 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -863,6 +969,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Int64.Type) throws -> Int64 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -879,6 +986,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: UInt.Type) throws -> UInt {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -895,6 +1003,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: UInt8.Type) throws -> UInt8 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -911,6 +1020,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: UInt16.Type) throws -> UInt16 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -927,6 +1037,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: UInt32.Type) throws -> UInt32 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -943,6 +1054,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: UInt64.Type) throws -> UInt64 {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -959,6 +1071,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Float.Type) throws -> Float {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -975,6 +1088,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: Double.Type) throws -> Double {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -991,6 +1105,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode(_ type: String.Type) throws -> String {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -1007,6 +1122,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func decode<T : Decodable>(_ type: T.Type) throws -> T {
+		tracker.use(currentIndex)
 		guard !self.isAtEnd else {
 			throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: self.decoder.codingPath + [_JSONKey(index: self.currentIndex)], debugDescription: "Unkeyed container is at end."))
 		}
@@ -1023,6 +1139,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func nestedContainer<NestedKey>(keyedBy type: NestedKey.Type) throws -> KeyedDecodingContainer<NestedKey> {
+		tracker.use(currentIndex)
 		self.decoder.codingPath.append(_JSONKey(index: self.currentIndex))
 		defer { self.decoder.codingPath.removeLast() }
 
@@ -1049,6 +1166,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func nestedUnkeyedContainer() throws -> UnkeyedDecodingContainer {
+		tracker.use(currentIndex)
 		self.decoder.codingPath.append(_JSONKey(index: self.currentIndex))
 		defer { self.decoder.codingPath.removeLast() }
 
@@ -1074,6 +1192,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 	}
 
 	public mutating func superDecoder() throws -> Decoder {
+		tracker.use(currentIndex)
 		self.decoder.codingPath.append(_JSONKey(index: self.currentIndex))
 		defer { self.decoder.codingPath.removeLast() }
 
@@ -1085,7 +1204,7 @@ fileprivate struct _JSONUnkeyedDecodingContainer : UnkeyedDecodingContainer {
 
 		let value = self.container[self.currentIndex]
 		self.currentIndex += 1
-		return _PedanticJSONDecoder(referencing: value, at: self.decoder.codingPath, options: self.decoder.options)
+		return _PedanticJSONDecoder(referencing: value, at: self.decoder.codingPath, options: self.decoder.options, tracker: decoder.tracker)
 	}
 }
 
