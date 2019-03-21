@@ -160,11 +160,11 @@ open class PedanticJSONDecoder {
 
 	public struct IgnoredKeys: CustomStringConvertible {
 
-		let path: [CodingKey]
-		let ignoredKeys: [JSONKey]
+		public let path: [CodingKey]
+		public let ignoredKeys: [JSONKey]
 
 		public var description: String {
-			return "Ignored the keys \(ignoredKeys) at path \(path)"
+			return "Ignored the keys \(ignoredKeys) at path \(path.map { $0.stringValue })"
 		}
 	}
 
