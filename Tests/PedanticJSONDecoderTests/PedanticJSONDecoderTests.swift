@@ -2,18 +2,18 @@ import XCTest
 @testable import PedanticJSONDecoder
 
 struct A: Codable {
-	var a: Int
+	var a: Bool
 	var b: String
 }
 
 struct B: Codable {
-	var a: Int
+	var a: Bool
 	var b: String
 	var c: Int
 }
 
 struct C: Codable {
-	var a: Int
+	var a: Bool
 	var b: String
 	var c: Int?
 }
@@ -26,14 +26,14 @@ struct D<Inner: Codable>: Codable {
 
 var aJSON = """
 	{
-		"a": 3,
+		"a": true,
 		"b": "a"
 	}
 	"""
 
 var bJSON = """
 	{
-		"a": 3,
+		"a": true,
 		"b": "a",
 		"c": 4
 	}

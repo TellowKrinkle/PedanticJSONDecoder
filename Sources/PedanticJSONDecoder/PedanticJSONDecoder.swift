@@ -100,6 +100,9 @@ fileprivate func _convertToSnakeCase(_ stringKey: String) -> String {
 	return result
 }
 
+fileprivate let kCFBooleanTrue = true as NSNumber
+fileprivate let kCFBooleanFalse = false as NSNumber
+
 //===----------------------------------------------------------------------===//
 // MARK: - JSON Decoder
 //===----------------------------------------------------------------------===//
